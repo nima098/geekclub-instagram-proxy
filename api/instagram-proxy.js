@@ -19,110 +19,92 @@ export default async function handler(req, res) {
   const shortcode = match[1];
 
   try {
-    // روش ۱: استفاده از API داخلی کلاینت اینستاگرام با هدرهای موبایل
-    const apiUrl = `https://www.instagram.com/p/${shortcode}/?__a=1&__d=dis`;
-    const response = await fetch(apiUrl, {
+    // ۱. دریافت صفحه امبد رسمی اینستاگرام که لینک مستقیم MP4 در پلیر آن تعبیه شده است
+    const embedUrl = `https://www.instagram.com/p/${shortcode}/embed/captioned/`;
+    const response = await fetch(embedUrl, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Instagram 298.0.0.23.110',
-        'Accept': 'application/json, text/plain, */*',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
         'Accept-Language': 'en-US,en;q=0.9',
-        'Sec-Fetch-Mode': 'cors',
-        'X-IG-App-ID': '936619743392459' // کلید پابلیک اینستاگرام وب
       }
     });
 
-    const rawText = await response.text();
+    const html = await response.text();
 
-    // بررسی اینکه آیا پاسخ واقعاً JSON است یا صفحه HTML برگشته
-    if (rawText.trim().startsWith('<') || rawText.includes('<!DOCTYPE')) {
-      // اگر اینستاگرام بلاک کرد، از روش دوم (استخراج تگ‌های OpenGraph) استفاده کن
-      return await parseViaHtmlOpenGraph(shortcode, res);
+    // استخراج کپشن
+    let caption = '';
+    const captionMatch = html.match(/class="Caption"[^>]*>([\s\S]*?)<\/div>/i);
+    if (captionMatch) {
+      caption = captionMatch[1].replace(/<[^>]+>/g, '').trim();
     }
 
-    let json;
-    try {
-      json = JSON.parse(rawText);
-    } catch (e) {
-      return await parseViaHtmlOpenGraph(shortcode, res);
+    // ۲. استخراج لینک مستقیم ویدیو MP4
+    let videoUrl = null;
+    let thumbnailUrl = null;
+
+    // جستجو در تگ video پلیر
+    const videoTagMatch = html.match(/<video[^>]*src="([^"]+)"/i) 
+                       || html.match(/class="EmbeddedMediaVideo"[^>]*src="([^"]+)"/i);
+    if (videoTagMatch) {
+      videoUrl = decodeHtml(videoTagMatch[1]);
     }
 
-    const item = json?.items?.[0] || json?.graphql?.shortcode_media;
-    if (!item) {
-      return await parseViaHtmlOpenGraph(shortcode, res);
-    }
-
-    const caption = item.caption?.text || item.edge_media_to_caption?.edges?.[0]?.node?.text || '';
-    const slides = [];
-
-    // اگر پست چند اسلایدی باشد (Carousel)
-    if (item.carousel_media && item.carousel_media.length > 0) {
-      item.carousel_media.forEach((m, idx) => {
-        const isVideo = m.media_type === 2 || Boolean(m.video_versions);
-        const videoUrl = m.video_versions?.[0]?.url;
-        const imgUrl = m.image_versions2?.candidates?.[0]?.url;
-        slides.push({
-          index: idx + 1,
-          type: isVideo ? 'video' : 'image',
-          media_url: isVideo ? videoUrl : imgUrl,
-          thumbnail_url: imgUrl || videoUrl
-        });
-      });
-    } else {
-      // پست تکی (ریلز یا عکس تکی)
-      const isVideo = item.media_type === 2 || Boolean(item.video_versions) || item.is_video;
-      const videoUrl = item.video_versions?.[0]?.url || item.video_url;
-      const imgUrl = item.image_versions2?.candidates?.[0]?.url || item.display_url;
-      slides.push({
-        index: 1,
-        type: isVideo ? 'video' : 'image',
-        media_url: isVideo ? videoUrl : imgUrl,
-        thumbnail_url: imgUrl || videoUrl
-      });
-    }
-
-    return res.status(200).json({
-      status: 'success',
-      shortcode,
-      caption,
-      slide_count: slides.length,
-      is_carousel: slides.length > 1,
-      slides
-    });
-
-  } catch (err) {
-    return await parseViaHtmlOpenGraph(shortcode, res);
-  }
-}
-
-// موتور پشتیبان: استخراج از کدهای متا og:video و og:image بدون بلاک شدن
-async function parseViaHtmlOpenGraph(shortcode, res) {
-  try {
-    const pageUrl = `https://www.instagram.com/p/${shortcode}/`;
-    const resp = await fetch(pageUrl, {
-      headers: {
-        'User-Agent': 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
-        'Accept': 'text/html'
+    // جستجو در کانفیگ‌های ویدیویی درون اسکریپت (video_url)
+    if (!videoUrl) {
+      const videoConfigMatch = html.match(/"video_url"\s*:\s*"([^"]+)"/i)
+                            || html.match(/"video_versions"\s*:\s*\[\s*\{\s*"url"\s*:\s*"([^"]+)"/i);
+      if (videoConfigMatch) {
+        videoUrl = videoConfigMatch[1].replace(/\\u0026/g, '&').replace(/\\/g, '');
       }
-    });
+    }
 
-    const html = await resp.text();
+    // ۳. استخراج پوستر و تصویر کاور
+    const posterMatch = html.match(/<video[^>]*poster="([^"]+)"/i)
+                     || html.match(/class="EmbeddedMediaImage"[^>]*src="([^"]+)"/i)
+                     || html.match(/"display_url"\s*:\s*"([^"]+)"/i);
+    if (posterMatch) {
+      thumbnailUrl = decodeHtml(posterMatch[1]).replace(/\\u0026/g, '&').replace(/\\/g, '');
+    }
 
-    const videoMatch = html.match(/<meta\s+property="og:video"\s+content="([^"]+)"/i) 
-                    || html.match(/<meta\s+property="og:video:secure_url"\s+content="([^"]+)"/i);
-    const imageMatch = html.match(/<meta\s+property="og:image"\s+content="([^"]+)"/i);
-    const titleMatch = html.match(/<meta\s+property="og:title"\s+content="([^"]+)"/i);
+    // ۴. اگر در امبد پیدا نشد، بررسی اسکریپت ساختاریافته (LD+JSON) در صفحه اصلی
+    if (!videoUrl) {
+      const pageResp = await fetch(`https://www.instagram.com/p/${shortcode}/`, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+        }
+      });
+      const pageHtml = await pageResp.text();
 
-    const isVideo = Boolean(videoMatch);
-    const mediaUrl = isVideo ? decodeHtml(videoMatch[1]) : (imageMatch ? decodeHtml(imageMatch[1]) : '');
+      const ldMatch = pageHtml.match(/<script type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/i);
+      if (ldMatch) {
+        try {
+          const ldData = JSON.parse(ldMatch[1]);
+          if (ldData.video && ldData.video.contentUrl) {
+            videoUrl = ldData.video.contentUrl;
+            thumbnailUrl = ldData.video.thumbnailUrl || thumbnailUrl;
+          }
+        } catch (e) {}
+      }
+
+      if (!videoUrl) {
+        const directVideoMatch = pageHtml.match(/"video_url"\s*:\s*"([^"]+)"/i);
+        if (directVideoMatch) {
+          videoUrl = directVideoMatch[1].replace(/\\u0026/g, '&').replace(/\\/g, '');
+        }
+      }
+    }
+
+    // ۵. قالب‌بندی خروجی
+    const isVideo = Boolean(videoUrl);
+    const mediaUrl = isVideo ? videoUrl : thumbnailUrl;
 
     if (!mediaUrl) {
-      return res.status(404).json({ error: 'پست یافت نشد یا پیج اینستاگرام خصوصی (Private) است.' });
+      return res.status(404).json({ error: 'فایل ویدیو در دسترس نیست یا پیج خصوصی است.' });
     }
 
     return res.status(200).json({
       status: 'success',
       shortcode,
-      caption: titleMatch ? decodeHtml(titleMatch[1]) : '',
+      caption: decodeHtml(caption),
       slide_count: 1,
       is_carousel: false,
       slides: [
@@ -130,12 +112,13 @@ async function parseViaHtmlOpenGraph(shortcode, res) {
           index: 1,
           type: isVideo ? 'video' : 'image',
           media_url: mediaUrl,
-          thumbnail_url: imageMatch ? decodeHtml(imageMatch[1]) : mediaUrl
+          thumbnail_url: thumbnailUrl || mediaUrl
         }
       ]
     });
-  } catch (e) {
-    return res.status(500).json({ error: 'خطا در دریافت رسانه از اینستاگرام: ' + e.message });
+
+  } catch (err) {
+    return res.status(500).json({ error: 'خطای استخراج ویدیو: ' + err.message });
   }
 }
 
