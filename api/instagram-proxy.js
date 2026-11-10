@@ -1,5 +1,7 @@
+import fetch from 'node-fetch';
+
 export default async function handler(req, res) {
-  // تنظیم هدرهای CORS برای دسترسی بدون محدودیت
+  // فعال‌سازی CORS برای پذیرش درخواست از سرور شما و مرورگرها
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -13,7 +15,7 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: 'پارامتر url الزامی است.' });
   }
 
-  // ۱. استخراج Shortcode
+  // استخراج شناسه پست (Shortcode)
   const match = url.match(/(?:\/p\/|\/reel\/|\/reels\/|\/tv\/)([A-Za-z0-9_-]+)/);
   if (!match) {
     return res.status(400).json({ error: 'فرمت لینک اینستاگرام نامعتبر است.' });
@@ -21,7 +23,7 @@ export default async function handler(req, res) {
   const shortcode = match[1];
 
   try {
-    // ۲. فراخوانی امبد اینستاگرام با fetch پیش‌فرض مرورگر/Node.js
+    // ۱. دریافت صفحه امبد عمومی از سرورهای خارج
     const embedUrl = `https://www.instagram.com/p/${shortcode}/embed/captioned/`;
     const response = await fetch(embedUrl, {
       headers: {
@@ -30,9 +32,13 @@ export default async function handler(req, res) {
       }
     });
 
+    if (!response.ok) {
+      throw new Error(`خطای اینستاگرام: HTTP ${response.status}`);
+    }
+
     const html = await response.text();
 
-    // ۳. استخراج کپشن
+    // ۲. استخراج کپشن
     let caption = '';
     const captionMatch = html.match(/class="Caption"[^>]*>([\s\S]*?)<\/div>/i);
     if (captionMatch) {
@@ -41,7 +47,7 @@ export default async function handler(req, res) {
 
     const slides = [];
 
-    // ۴. استخراج ویدیوها
+    // ۳. استخراج ویدیوها
     const videoMatches = [...html.matchAll(/class="EmbeddedMediaVideo"[^>]*src="([^"]+)"/gi)];
     videoMatches.forEach((m, idx) => {
       slides.push({
@@ -52,7 +58,7 @@ export default async function handler(req, res) {
       });
     });
 
-    // ۵. استخراج تصاویر
+    // ۴. استخراج تصاویر در صورتی که عکس باشد
     if (slides.length === 0) {
       const imgMatches = [...html.matchAll(/class="EmbeddedMediaImage"[^>]*src="([^"]+)"/gi)];
       imgMatches.forEach((m, idx) => {
@@ -65,21 +71,23 @@ export default async function handler(req, res) {
       });
     }
 
-    // ۶. پشتیبان OEmbed در صورت بسته بودن
+    // ۵. پشتیبان در صورت مسدود بودن امبد (OEmbed fallback)
     if (slides.length === 0) {
-      try {
-        const oembedRes = await fetch(`https://api.instagram.com/oembed/?url=https://www.instagram.com/p/${shortcode}/`);
-        if (oembedRes.ok) {
-          const oembedData = await oembedRes.json();
-          slides.push({
-            index: 1,
-            type: 'image',
-            media_url: oembedData.thumbnail_url,
-            thumbnail_url: oembedData.thumbnail_url
-          });
-          caption = caption || oembedData.title || '';
-        }
-      } catch (oe) {}
+      const oembedRes = await fetch(`https://api.instagram.com/oembed/?url=https://www.instagram.com/p/${shortcode}/`);
+      if (oembedRes.ok) {
+        const oembedData = await oembedRes.json();
+        slides.push({
+          index: 1,
+          type: 'image',
+          media_url: oembedData.thumbnail_url,
+          thumbnail_url: oembedData.thumbnail_url
+        });
+        caption = caption || oembedData.title || '';
+      }
+    }
+
+    if (slides.length === 0) {
+      return res.status(404).json({ error: 'فایل ویدیو یا عکسی یافت نشد (احتمالاً پیج خصوصی است).' });
     }
 
     return res.status(200).json({
