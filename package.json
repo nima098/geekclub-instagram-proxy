@@ -1,6 +1,7 @@
 {
   "name": "geekclub-instagram-proxy",
   "version": "2.0.0",
+  "main": "api/instagram-proxy.js",
   "dependencies": {
     "basic-ftp": "^5.0.5"
   }
