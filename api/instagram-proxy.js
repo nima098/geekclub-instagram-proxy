@@ -117,43 +117,69 @@ export default async function handler(req, res) {
         caption = captionMatch[1].replace(/<[^>]+>/g, '').trim();
       }
 
-      const videoMatches = [...html.matchAll(/class="EmbeddedMediaVideo"[^>]*src="([^"]+)"/gi)];
-      const imgMatches = [...html.matchAll(/class="EmbeddedMediaImage"[^>]*src="([^"]+)"/gi)];
+      // استخراج تمام تصاویر و ویدیوهای موجود در اسلایدها (با الگوهای چندگانه کلاس و تگ)
+      const videoMatches = [
+        ...html.matchAll(/class="EmbeddedMediaVideo"[^>]*src="([^"]+)"/gi),
+        ...html.matchAll(/<video[^>]*src="([^"]+)"/gi),
+        ...html.matchAll(/"video_url"\s*:\s*"([^"]+)"/gi)
+      ];
+      const imgMatches = [
+        ...html.matchAll(/class="EmbeddedMediaImage"[^>]*src="([^"]+)"/gi),
+        ...html.matchAll(/<img[^>]*class="[^"]*EmbeddedMedia[^"]*"[^>]*src="([^"]+)"/gi),
+        ...html.matchAll(/"display_url"\s*:\s*"([^"]+)"/gi)
+      ];
+
+      const seenUrls = new Set();
 
       if (videoMatches.length > 0) {
-        videoMatches.forEach((m, idx) => {
-          slides.push({
-            index: idx + 1,
-            type: 'video',
-            raw_media_url: decodeHtml(m[1]),
-            raw_thumb_url: imgMatches[idx] ? decodeHtml(imgMatches[idx][1]) : ''
-          });
+        videoMatches.forEach((m) => {
+          const rawV = decodeHtml(m[1]).replace(/\\u0026/g, '&');
+          if (!seenUrls.has(rawV)) {
+            seenUrls.add(rawV);
+            slides.push({
+              index: slides.length + 1,
+              type: 'video',
+              raw_media_url: rawV,
+              raw_thumb_url: imgMatches[0] ? decodeHtml(imgMatches[0][1]).replace(/\\u0026/g, '&') : ''
+            });
+          }
         });
       } else if (imgMatches.length > 0) {
-        imgMatches.forEach((m, idx) => {
-          slides.push({
-            index: idx + 1,
-            type: 'image',
-            raw_media_url: decodeHtml(m[1]),
-            raw_thumb_url: decodeHtml(m[1])
-          });
+        imgMatches.forEach((m) => {
+          const rawImg = decodeHtml(m[1]).replace(/\\u0026/g, '&');
+          if (!seenUrls.has(rawImg)) {
+            seenUrls.add(rawImg);
+            slides.push({
+              index: slides.length + 1,
+              type: 'image',
+              raw_media_url: rawImg,
+              raw_thumb_url: rawImg
+            });
+          }
         });
       }
     }
 
     if (slides.length === 0) {
-      const oembedRes = await fetch(`https://api.instagram.com/oembed/?url=https://www.instagram.com/p/${shortcode}/`, {
-        headers: { 'User-Agent': 'Mozilla/5.0' }
-      });
-      if (oembedRes.ok) {
-        const odata = await oembedRes.json();
-        caption = odata.title || '';
-        slides.push({
-          index: 1,
-          type: 'image',
-          raw_media_url: odata.thumbnail_url,
-          raw_thumb_url: odata.thumbnail_url
+      try {
+        const oembedRes = await fetch(`https://api.instagram.com/oembed/?url=https://www.instagram.com/p/${shortcode}/`, {
+          headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
         });
+        const oembedText = await oembedRes.text();
+        if (oembedRes.ok && oembedText && oembedText.trim().startsWith('{')) {
+          const odata = JSON.parse(oembedText);
+          caption = odata.title || '';
+          if (odata.thumbnail_url) {
+            slides.push({
+              index: 1,
+              type: 'image',
+              raw_media_url: odata.thumbnail_url,
+              raw_thumb_url: odata.thumbnail_url
+            });
+          }
+        }
+      } catch (e) {
+        console.warn('Oembed fallback error:', e.message);
       }
     }
 
