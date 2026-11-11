@@ -1,316 +1,171 @@
-// ========================================================
-// مسیر در پروژه ورسل: api/instagram-proxy.js
-// اجرا روی Node.js Serverless Function (Vercel)
-// ========================================================
+const fs = require('fs');
+const path = require('path');
+const ftp = require('basic-ftp');
 
-// ========================================================
-// مسیر در پروژه ورسل: api/instagram-proxy.js
-// نیازمند پکیج basic-ftp در ورسل (npm install basic-ftp)
-// اجرا روی Node.js Serverless Function (Vercel)
-// ========================================================
+const FTP_CONFIG = {
+  host: 'upc.geekclub.ir',
+  user: 'new@upc.geekclub.ir',
+  password: '1z{Tf_@LAZg}#l0[',
+  port: 21,
+  secure: false
+};
 
-import fs from 'fs';
-import path from 'path';
-import { Client as FtpClient } from 'basic-ftp';
+const TTL_MS = 12 * 60 * 60 * 1000; // ۱۲ ساعت مهلت ماندگاری فایل در ورسل
 
-// دایرکتوری ذخیره‌سازی محلی در ورسل (پوشه موقت استاندارد لینوکسی سرورلس)
-const TMP_STORAGE_DIR = path.join('/tmp', 'instagram_cache');
-const TTL_HOURS = 12;
-const TTL_MS = TTL_HOURS * 60 * 60 * 1000;
-
-// پاکسازی فایل‌های قدیمی‌تر از ۱۲ ساعت در ورسل
-function cleanupExpiredFiles() {
+function cleanupExpiredFiles(baseDir) {
+  if (!fs.existsSync(baseDir)) return 0;
+  let freedBytes = 0;
+  const now = Date.now();
   try {
-    if (!fs.existsSync(TMP_STORAGE_DIR)) return;
-    const now = Date.now();
-    const shortcodeFolders = fs.readdirSync(TMP_STORAGE_DIR);
-    for (const folder of shortcodeFolders) {
-      const folderPath = path.join(TMP_STORAGE_DIR, folder);
-      const stat = fs.statSync(folderPath);
-      if (now - stat.mtimeMs > TTL_MS) {
-        fs.rmSync(folderPath, { recursive: true, force: true });
+    const entries = fs.readdirSync(baseDir, { withFileTypes: true });
+    for (const ent of entries) {
+      const fullPath = path.join(baseDir, ent.name);
+      if (ent.isDirectory()) {
+        const stats = fs.statSync(fullPath);
+        if (now - stats.mtimeMs > TTL_MS) {
+          fs.rmSync(fullPath, { recursive: true, force: true });
+        }
       }
     }
-  } catch (err) {
-    console.error('Error during 12h cleanup:', err.message);
-  }
+  } catch (e) {}
+  return freedBytes;
 }
 
-export default async function handler(req, res) {
-  // فعال‌سازی CORS برای پذیرش درخواست از انجمن زنفورو
+module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
+  if (req.method === 'OPTIONS') return res.status(200).end();
+
+  const targetUrl = req.query.url;
+  const apifyToken = req.query.apify_token || process.env.APIFY_TOKEN;
+  const isDebug = req.query.debug === '1';
+
+  // تست و اجرای پاکسازی ۱۲ ساعته در صورت درخواست
+  if (req.query.check_cleanup === '1') {
+    const tmpBase = '/tmp/instagram_cache';
+    const freed = cleanupExpiredFiles(tmpBase);
+    return res.status(200).json({
+      status: 'ok',
+      ttl_policy: {
+        ttl_hours: 12,
+        ttl_seconds: 43200,
+        storage_directory: tmpBase
+      },
+      cleanup_report: { total_freed_bytes: freed }
+    });
   }
 
-  // اجرای پاکسازی خودکار فایل‌های قدیمی‌تر از ۱۲ ساعت در ورسل
-  cleanupExpiredFiles();
-
-  // سرو مستقیم بایت‌های ذخیره‌شده از پوشه موقت ورسل در صورت درخواست
-  const { serve_file, sc } = req.query;
-  if (serve_file && sc) {
-    const safeFile = path.basename(serve_file);
-    const safeSc = path.basename(sc);
-    const filePath = path.join(TMP_STORAGE_DIR, safeSc, safeFile);
-    if (fs.existsSync(filePath)) {
-      const mime = safeFile.endsWith('.mp4') ? 'video/mp4' : 'image/jpeg';
-      res.setHeader('Content-Type', mime);
-      res.setHeader('Cache-Control', 'public, max-age=43200'); // 12 hours
-      return res.status(200).send(fs.readFileSync(filePath));
-    }
-    return res.status(404).send('File expired or not found');
+  if (!targetUrl) {
+    return res.status(400).json({ error: 'آدرس URL مشخص نشده است.' });
   }
 
-  // قابلیت پروکسی استریم مستقیم بایت‌های مدیا از اینستاگرام
-  const { proxy_media } = req.query;
-  if (proxy_media) {
+  const isInsta = targetUrl.match(/(?:\/p\/|\/reel\/|\/reels\/|\/tv\/)([A-Za-z0-9_-]+)/);
+  const shortcode = isInsta ? isInsta[1] : 'custom_' + Math.random().toString(36).substring(2, 9);
+
+  const localDir = path.join('/tmp', 'instagram_cache', shortcode);
+  if (!fs.existsSync(localDir)) {
+    fs.mkdirSync(localDir, { recursive: true });
+  }
+
+  // پاکسازی پیش‌فرض فایل‌های منقضی‌شده قدیمی‌تر از ۱۲ ساعت
+  cleanupExpiredFiles('/tmp/instagram_cache');
+
+  let mediaUrl = '';
+  let captionText = '';
+  let extractionMethod = 'local_curl_engine';
+
+  // ۱. تست دریافت اطلاعات از Apify API در صورت وجود توکن
+  if (apifyToken) {
     try {
-      const decodedUrl = decodeURIComponent(proxy_media);
-      const mediaRes = await fetch(decodedUrl, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-        }
+      const apifyApiUrl = `https://api.apify.com/v2/acts/apify~instagram-reel-scraper/run-sync-get-dataset-items?token=${encodeURIComponent(apifyToken)}`;
+      const apifyResp = await fetch(apifyApiUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ directUrls: [targetUrl], resultsLimit: 1 })
       });
-      if (!mediaRes.ok) {
-        return res.status(mediaRes.status).send('Media fetch failed: ' + mediaRes.statusText);
+      if (apifyResp.ok) {
+        const apifyItems = await apifyResp.json();
+        if (Array.isArray(apifyItems) && apifyItems.length > 0) {
+          const item = apifyItems[0];
+          mediaUrl = item.videoUrl || item.displayUrl || '';
+          captionText = item.caption || '';
+          if (mediaUrl) extractionMethod = 'apify_api';
+        }
       }
-      const contentType = mediaRes.headers.get('content-type') || 'application/octet-stream';
-      res.setHeader('Content-Type', contentType);
-      const buffer = await mediaRes.arrayBuffer();
-      return res.status(200).send(Buffer.from(buffer));
-    } catch (err) {
-      return res.status(500).send('Proxy Stream Error: ' + err.message);
-    }
+    } catch (e) {}
   }
 
-  const { url, offload_ftp } = req.query;
-  if (!url) {
-    return res.status(400).json({ error: 'پارامتر url الزامی است.' });
+  // ۲. فال‌بک به موتور بومی cURL در صورت عدم استخراج با Apify
+  if (!mediaUrl) {
+    try {
+      const execSync = require('child_process').execSync;
+      const cleanUrl = targetUrl.split('?')[0].replace(/\/$/, '') + '/embed/';
+      const curlCmd = `curl -s -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36" "${cleanUrl}"`;
+      const html = execSync(curlCmd, { timeout: 15000 }).toString();
+
+      const vidMatch = html.match(/video_url(?:\\*)"\s*:\s*(?:\\*)"(https:[^"]+?)"/);
+      if (vidMatch) {
+        mediaUrl = vidMatch[1].replace(/\\/g, '').replace(/&amp;/g, '&');
+      } else {
+        const imgMatch = html.match(/display_url(?:\\*)"\s*:\s*(?:\\*)"(https:[^"]+?)"/);
+        if (imgMatch) {
+          mediaUrl = imgMatch[1].replace(/\\/g, '').replace(/&amp;/g, '&');
+        }
+      }
+    } catch (e) {}
   }
+
+  if (!mediaUrl) {
+    return res.status(404).json({ error: 'محتوای اینستاگرام یافت نشد یا خصوصی است.' });
+  }
+
+  // ۳. دانلود فیزیکی رسانه به حافظه موقت /tmp ورسل
+  const isVideo = !mediaUrl.includes('.jpg') && !mediaUrl.includes('.jpeg') && !mediaUrl.includes('.webp');
+  const ext = isVideo ? 'mp4' : 'jpg';
+  const localFilePath = path.join(localDir, `slide_1.${ext}`);
 
   try {
-    // ۱. استخراج کد کوتاه (Shortcode) از لینک اینستاگرام
-    const match = url.match(/(?:\/p\/|\/reel\/|\/reels\/|\/tv\/)([A-Za-z0-9_-]+)/);
-    if (!match) {
-      return res.status(400).json({ error: 'فرمت لینک اینستاگرام نامعتبر است.' });
+    const execSync = require('child_process').execSync;
+    execSync(`curl -s -L -o "${localFilePath}" "${mediaUrl}"`, { timeout: 20000 });
+  } catch (e) {}
+
+  const fileSizeBytes = fs.existsSync(localFilePath) ? fs.statSync(localFilePath).size : 0;
+
+  // ۴. آفلود خودکار FTP به هاست CDN (upc.geekclub.ir)
+  const ftpReport = [];
+  let cdnPublicUrl = `https://upc.geekclub.ir/forum/instagram_downloader/${shortcode}/slide_1.${ext}`;
+
+  if (fileSizeBytes > 0) {
+    const client = new ftp.Client(20000);
+    try {
+      await client.access(FTP_CONFIG);
+      const remoteDir = `/forum/instagram_downloader/${shortcode}`;
+      await client.ensureDir(remoteDir);
+      await client.uploadFrom(localFilePath, `slide_1.${ext}`);
+      ftpReport.push({ status: 'uploaded', remote_dir: remoteDir });
+    } catch (err) {
+      ftpReport.push({ status: 'failed', error: err.message });
+    } finally {
+      client.close();
     }
-    const shortcode = match[1];
-
-    // ۲. دریافت اطلاعات ساختاریافته از اینستاگرام (Embed Captioned)
-    const embedUrl = `https://www.instagram.com/p/${shortcode}/embed/captioned/`;
-    const response = await fetch(embedUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-      }
-    });
-
-    let slides = [];
-    let caption = '';
-
-    if (response.ok) {
-      const html = await response.text();
-      const captionMatch = html.match(/<div class="Caption"[^>]*>([\s\S]*?)<\/div>/i);
-      if (captionMatch) {
-        caption = captionMatch[1].replace(/<[^>]+>/g, '').trim();
-      }
-
-      // استخراج تمام تصاویر و ویدیوهای موجود در اسلایدها (با الگوهای چندگانه کلاس و تگ)
-      const videoMatches = [
-        ...html.matchAll(/class="EmbeddedMediaVideo"[^>]*src="([^"]+)"/gi),
-        ...html.matchAll(/<video[^>]*src="([^"]+)"/gi),
-        ...html.matchAll(/"video_url"\s*:\s*"([^"]+)"/gi)
-      ];
-      const imgMatches = [
-        ...html.matchAll(/class="EmbeddedMediaImage"[^>]*src="([^"]+)"/gi),
-        ...html.matchAll(/<img[^>]*class="[^"]*EmbeddedMedia[^"]*"[^>]*src="([^"]+)"/gi),
-        ...html.matchAll(/"display_url"\s*:\s*"([^"]+)"/gi)
-      ];
-
-      const seenUrls = new Set();
-
-      if (videoMatches.length > 0) {
-        videoMatches.forEach((m) => {
-          const rawV = decodeHtml(m[1]).replace(/\\u0026/g, '&');
-          if (!seenUrls.has(rawV)) {
-            seenUrls.add(rawV);
-            slides.push({
-              index: slides.length + 1,
-              type: 'video',
-              raw_media_url: rawV,
-              raw_thumb_url: imgMatches[0] ? decodeHtml(imgMatches[0][1]).replace(/\\u0026/g, '&') : ''
-            });
-          }
-        });
-      } else if (imgMatches.length > 0) {
-        imgMatches.forEach((m) => {
-          const rawImg = decodeHtml(m[1]).replace(/\\u0026/g, '&');
-          if (!seenUrls.has(rawImg)) {
-            seenUrls.add(rawImg);
-            slides.push({
-              index: slides.length + 1,
-              type: 'image',
-              raw_media_url: rawImg,
-              raw_thumb_url: rawImg
-            });
-          }
-        });
-      }
-    }
-
-    if (slides.length === 0) {
-      try {
-        const oembedRes = await fetch(`https://api.instagram.com/oembed/?url=https://www.instagram.com/p/${shortcode}/`, {
-          headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
-        });
-        const oembedText = await oembedRes.text();
-        if (oembedRes.ok && oembedText && oembedText.trim().startsWith('{')) {
-          const odata = JSON.parse(oembedText);
-          caption = odata.title || '';
-          if (odata.thumbnail_url) {
-            slides.push({
-              index: 1,
-              type: 'image',
-              raw_media_url: odata.thumbnail_url,
-              raw_thumb_url: odata.thumbnail_url
-            });
-          }
-        }
-      } catch (e) {
-        console.warn('Oembed fallback error:', e.message);
-      }
-    }
-
-    if (slides.length === 0) {
-      return res.status(404).json({ error: 'محتوای پست یا ریلز اینستاگرام یافت نشد یا خصوصی است.' });
-    }
-
-    // ۳. مرحله دانلود فیزیکی فایل‌ها درون استوریج موقت Vercel (/tmp)
-    const localPostDir = path.join(TMP_STORAGE_DIR, shortcode);
-    if (!fs.existsSync(localPostDir)) {
-      fs.mkdirSync(localPostDir, { recursive: true });
-    }
-
-    const host = req.headers['x-forwarded-host'] || req.headers.host || 'geekclub-instagram-proxy.vercel.app';
-    const proto = req.headers['x-forwarded-proto'] || 'https';
-    const baseUrl = `${proto}://${host}/api/instagram-proxy`;
-
-    const downloadedSlides = [];
-    for (const slide of slides) {
-      const ext = (slide.type === 'video') ? 'mp4' : 'jpg';
-      const fileName = `slide_${slide.index}.${ext}`;
-      const localFilePath = path.join(localPostDir, fileName);
-
-      // دانلود مدیا درون ورسل
-      const mRes = await fetch(slide.raw_media_url, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
-      });
-      if (mRes.ok) {
-        const buf = Buffer.from(await mRes.arrayBuffer());
-        fs.writeFileSync(localFilePath, buf);
-      }
-
-      // اگر تامبنیل وجود داشت دانلود کن
-      let localThumbPath = '';
-      if (slide.raw_thumb_url) {
-        const thumbName = `thumb_${slide.index}.jpg`;
-        localThumbPath = path.join(localPostDir, thumbName);
-        const tRes = await fetch(slide.raw_thumb_url, {
-          headers: { 'User-Agent': 'Mozilla/5.0' }
-        });
-        if (tRes.ok) {
-          fs.writeFileSync(localThumbPath, Buffer.from(await tRes.arrayBuffer()));
-        }
-      }
-
-      downloadedSlides.push({
-        index: slide.index,
-        type: slide.type,
-        file_name: fileName,
-        local_file_path: localFilePath,
-        local_thumb_path: localThumbPath,
-        size_bytes: fs.existsSync(localFilePath) ? fs.statSync(localFilePath).size : 0,
-        vercel_download_url: `${baseUrl}?serve_file=${fileName}&sc=${shortcode}`,
-        vercel_thumb_url: localThumbPath ? `${baseUrl}?serve_file=thumb_${slide.index}.jpg&sc=${shortcode}` : ''
-      });
-    }
-
-    // ۴. مرحله اتصال مستقیم به FTP هاست CDN و ارسال فایل‌های دانلودشده از ورسل به CDN
-    let ftpUploadResults = [];
-    const shouldFtpOffload = (offload_ftp === '1' || offload_ftp === 'true' || true); // به صورت پیش‌فرض آفلود انجام می‌شود
-
-    if (shouldFtpOffload) {
-      const ftp = new FtpClient(30000); // 30s timeout
-      try {
-        await ftp.access({
-          host: process.env.CDN_FTP_HOST || 'upc.geekclub.ir',
-          user: process.env.CDN_FTP_USER || 'new@upc.geekclub.ir',
-          password: process.env.CDN_FTP_PASSWORD || '1z{Tf_@LAZg}#l0[',
-          port: parseInt(process.env.CDN_FTP_PORT || '21', 10),
-          secure: false
-        });
-
-        for (const s of downloadedSlides) {
-          if (!fs.existsSync(s.local_file_path)) continue;
-
-          // مسیر مقصد در CDN
-          const remoteDir = `/forum/instagram_downloader/${shortcode}`;
-          await ftp.ensureDir(remoteDir);
-
-          const remoteMediaPath = `${remoteDir}/${s.file_name}`;
-          await ftp.uploadFrom(s.local_file_path, remoteMediaPath);
-
-          if (s.local_thumb_path && fs.existsSync(s.local_thumb_path)) {
-            await ftp.uploadFrom(s.local_thumb_path, `${remoteDir}/thumb_${s.index}.jpg`);
-          }
-
-          ftpUploadResults.push({
-            file: s.file_name,
-            status: 'uploaded',
-            cdn_url: `https://upc.geekclub.ir/forum/instagram_downloader/${shortcode}/${s.file_name}`
-          });
-        }
-      } catch (ftpErr) {
-        ftpUploadResults.push({ error: 'FTP Offload Error: ' + ftpErr.message });
-      } finally {
-        ftp.close();
-      }
-    }
-
-    // ۵. خروجی نهایی به سرور زنفورو با لینک‌های CDN و لینک‌های پشتیبان ورسل
-    const responseSlides = downloadedSlides.map((s, idx) => {
-      const cdnUrl = `https://upc.geekclub.ir/forum/instagram_downloader/${shortcode}/${s.file_name}`;
-      const cdnThumb = `https://upc.geekclub.ir/forum/instagram_downloader/${shortcode}/thumb_${s.index}.jpg`;
-      return {
-        index: s.index,
-        type: s.type,
-        cdn_url: cdnUrl,
-        fallback_url: s.vercel_download_url,
-        thumbnail_url: cdnThumb,
-        size_bytes: s.size_bytes
-      };
-    });
-
-    return res.status(200).json({
-      status: 'success',
-      shortcode,
-      caption,
-      slide_count: responseSlides.length,
-      is_carousel: responseSlides.length > 1,
-      retention_in_vercel: '12_hours_auto_cleanup',
-      slides: responseSlides,
-      ftp_report: ftpUploadResults
-    });
-
-  } catch (err) {
-    return res.status(500).json({
-      error: 'خطا در چرخه دانلود ورسل و آفلود CDN: ' + err.message
-    });
   }
-}
 
-function decodeHtml(html) {
-  return html.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"');
-}
+  // ۵. بازگرداندن خروجی نهایی
+  return res.status(200).json({
+    shortcode: shortcode,
+    caption: captionText,
+    extraction_method: extractionMethod,
+    slides: [
+      {
+        index: 1,
+        type: isVideo ? 'video' : 'image',
+        size_bytes: fileSizeBytes,
+        fallback_url: mediaUrl,
+        cdn_url: cdnPublicUrl
+      }
+    ],
+    ftp_report: ftpReport
+  });
+};
