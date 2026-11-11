@@ -1,6 +1,8 @@
 {
+  "version": 2,
   "rewrites": [
     { "source": "/api/instagram-proxy", "destination": "/api/instagram-proxy.js" },
+    { "source": "/api/(.*)", "destination": "/api/instagram-proxy.js" },
     { "source": "/(.*)", "destination": "/api/instagram-proxy.js" }
   ]
 }
