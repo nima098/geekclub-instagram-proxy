@@ -1,7 +1,6 @@
 {
   "name": "geekclub-instagram-proxy",
-  "version": "1.0.0",
-  "type": "module",
+  "version": "2.0.0",
   "dependencies": {
     "basic-ftp": "^5.0.5"
   }
