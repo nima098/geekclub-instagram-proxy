@@ -1,5 +1,10 @@
 // ========================================================
 // مسیر در پروژه ورسل: api/instagram-proxy.js
+// اجرا روی Node.js Serverless Function (Vercel)
+// ========================================================
+
+// ========================================================
+// مسیر در پروژه ورسل: api/instagram-proxy.js
 // نیازمند پکیج basic-ftp در ورسل (npm install basic-ftp)
 // اجرا روی Node.js Serverless Function (Vercel)
 // ========================================================
@@ -44,7 +49,7 @@ export default async function handler(req, res) {
   // اجرای پاکسازی خودکار فایل‌های قدیمی‌تر از ۱۲ ساعت در ورسل
   cleanupExpiredFiles();
 
-  // سرو مستقیم بایت‌های ذخیره‌شده از پوشه موقت ورسل در صورت نیاز
+  // سرو مستقیم بایت‌های ذخیره‌شده از پوشه موقت ورسل در صورت درخواست
   const { serve_file, sc } = req.query;
   if (serve_file && sc) {
     const safeFile = path.basename(serve_file);
@@ -57,6 +62,28 @@ export default async function handler(req, res) {
       return res.status(200).send(fs.readFileSync(filePath));
     }
     return res.status(404).send('File expired or not found');
+  }
+
+  // قابلیت پروکسی استریم مستقیم بایت‌های مدیا از اینستاگرام
+  const { proxy_media } = req.query;
+  if (proxy_media) {
+    try {
+      const decodedUrl = decodeURIComponent(proxy_media);
+      const mediaRes = await fetch(decodedUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+        }
+      });
+      if (!mediaRes.ok) {
+        return res.status(mediaRes.status).send('Media fetch failed: ' + mediaRes.statusText);
+      }
+      const contentType = mediaRes.headers.get('content-type') || 'application/octet-stream';
+      res.setHeader('Content-Type', contentType);
+      const buffer = await mediaRes.arrayBuffer();
+      return res.status(200).send(Buffer.from(buffer));
+    } catch (err) {
+      return res.status(500).send('Proxy Stream Error: ' + err.message);
+    }
   }
 
   const { url, offload_ftp } = req.query;
@@ -159,7 +186,7 @@ export default async function handler(req, res) {
         fs.writeFileSync(localFilePath, buf);
       }
 
-      // دانلود کاور ویدیو درون ورسل
+      // اگر تامبنیل وجود داشت دانلود کن
       let localThumbPath = '';
       if (slide.raw_thumb_url) {
         const thumbName = `thumb_${slide.index}.jpg`;
@@ -186,7 +213,7 @@ export default async function handler(req, res) {
 
     // ۴. مرحله اتصال مستقیم به FTP هاست CDN و ارسال فایل‌های دانلودشده از ورسل به CDN
     let ftpUploadResults = [];
-    const shouldFtpOffload = (offload_ftp === '1' || offload_ftp === 'true' || true);
+    const shouldFtpOffload = (offload_ftp === '1' || offload_ftp === 'true' || true); // به صورت پیش‌فرض آفلود انجام می‌شود
 
     if (shouldFtpOffload) {
       const ftp = new FtpClient(30000); // 30s timeout
@@ -226,8 +253,8 @@ export default async function handler(req, res) {
       }
     }
 
-    // ۵. خروجی نهایی با لینک‌های CDN و لینک‌های پشتیبان ورسل
-    const responseSlides = downloadedSlides.map((s) => {
+    // ۵. خروجی نهایی به سرور زنفورو با لینک‌های CDN و لینک‌های پشتیبان ورسل
+    const responseSlides = downloadedSlides.map((s, idx) => {
       const cdnUrl = `https://upc.geekclub.ir/forum/instagram_downloader/${shortcode}/${s.file_name}`;
       const cdnThumb = `https://upc.geekclub.ir/forum/instagram_downloader/${shortcode}/thumb_${s.index}.jpg`;
       return {
