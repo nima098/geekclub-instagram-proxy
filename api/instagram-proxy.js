@@ -151,7 +151,12 @@ module.exports = async (req, res) => {
       client.close();
     }
   }
-
+// در api/instagram-proxy.js این بخش را بررسی کنید
+if (!mediaUrl) {
+  return res.status(404).json({ 
+    error: 'محتوای اینستاگرام یافت نشد، خصوصی است، یا توسط گارد TLS اینستاگرام مسدود شده است. لطفاً از توکن Apify API استفاده فرمایید.' 
+  });
+}
   // ۵. بازگرداندن خروجی نهایی
   return res.status(200).json({
     shortcode: shortcode,
