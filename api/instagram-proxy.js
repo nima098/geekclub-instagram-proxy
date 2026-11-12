@@ -10,11 +10,10 @@ const FTP_CONFIG = {
   secure: false
 };
 
-const TTL_MS = 12 * 60 * 60 * 1000; // ۱۲ ساعت مهلت ماندگاری فایل در ورسل
+const TTL_MS = 12 * 60 * 60 * 1000; // ۱۲ ساعت
 
 function cleanupExpiredFiles(baseDir) {
-  if (!fs.existsSync(baseDir)) return 0;
-  let freedBytes = 0;
+  if (!fs.existsSync(baseDir)) return;
   const now = Date.now();
   try {
     const entries = fs.readdirSync(baseDir, { withFileTypes: true });
@@ -28,7 +27,6 @@ function cleanupExpiredFiles(baseDir) {
       }
     }
   } catch (e) {}
-  return freedBytes;
 }
 
 module.exports = async (req, res) => {
@@ -40,21 +38,11 @@ module.exports = async (req, res) => {
 
   const targetUrl = req.query.url;
   const apifyToken = req.query.apify_token || process.env.APIFY_TOKEN;
-  const isDebug = req.query.debug === '1';
 
-  // تست و اجرای پاکسازی ۱۲ ساعته در صورت درخواست
   if (req.query.check_cleanup === '1') {
     const tmpBase = '/tmp/instagram_cache';
-    const freed = cleanupExpiredFiles(tmpBase);
-    return res.status(200).json({
-      status: 'ok',
-      ttl_policy: {
-        ttl_hours: 12,
-        ttl_seconds: 43200,
-        storage_directory: tmpBase
-      },
-      cleanup_report: { total_freed_bytes: freed }
-    });
+    cleanupExpiredFiles(tmpBase);
+    return res.status(200).json({ status: 'ok', ttl_policy: { hours: 12 } });
   }
 
   if (!targetUrl) {
@@ -68,15 +56,13 @@ module.exports = async (req, res) => {
   if (!fs.existsSync(localDir)) {
     fs.mkdirSync(localDir, { recursive: true });
   }
-
-  // پاکسازی پیش‌فرض فایل‌های منقضی‌شده قدیمی‌تر از ۱۲ ساعت
   cleanupExpiredFiles('/tmp/instagram_cache');
 
   let mediaUrl = '';
   let captionText = '';
   let extractionMethod = 'local_curl_engine';
 
-  // ۱. تست دریافت اطلاعات از Apify API در صورت وجود توکن
+  // ۱. استفاده از Apify در صورت وجود توکن
   if (apifyToken) {
     try {
       const apifyApiUrl = `https://api.apify.com/v2/acts/apify~instagram-reel-scraper/run-sync-get-dataset-items?token=${encodeURIComponent(apifyToken)}`;
@@ -97,12 +83,12 @@ module.exports = async (req, res) => {
     } catch (e) {}
   }
 
-  // ۲. فال‌بک به موتور بومی cURL در صورت عدم استخراج با Apify
+  // ۲. استخراج با cURL پیشرفته در صورت عدم استفاده از Apify
   if (!mediaUrl) {
     try {
       const execSync = require('child_process').execSync;
       const cleanUrl = targetUrl.split('?')[0].replace(/\/$/, '') + '/embed/';
-      const curlCmd = `curl -s -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36" "${cleanUrl}"`;
+      const curlCmd = `curl -s -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" -H "Accept-Language: en-US,en;q=0.9" -H "Sec-Fetch-Dest: document" "${cleanUrl}"`;
       const html = execSync(curlCmd, { timeout: 15000 }).toString();
 
       const vidMatch = html.match(/video_url(?:\\*)"\s*:\s*(?:\\*)"(https:[^"]+?)"/);
@@ -118,10 +104,12 @@ module.exports = async (req, res) => {
   }
 
   if (!mediaUrl) {
-    return res.status(404).json({ error: 'محتوای اینستاگرام یافت نشد یا خصوصی است.' });
+    return res.status(404).json({ 
+      error: 'محتوای اینستاگرام توسط اینستاگرام مسدود شده است. لطفاً توکن Apify API را وارد فرمایید یا پست دیگری را تست کنید.' 
+    });
   }
 
-  // ۳. دانلود فیزیکی رسانه به حافظه موقت /tmp ورسل
+  // ۳. دانلود فیزیکی در /tmp
   const isVideo = !mediaUrl.includes('.jpg') && !mediaUrl.includes('.jpeg') && !mediaUrl.includes('.webp');
   const ext = isVideo ? 'mp4' : 'jpg';
   const localFilePath = path.join(localDir, `slide_1.${ext}`);
@@ -133,7 +121,7 @@ module.exports = async (req, res) => {
 
   const fileSizeBytes = fs.existsSync(localFilePath) ? fs.statSync(localFilePath).size : 0;
 
-  // ۴. آفلود خودکار FTP به هاست CDN (upc.geekclub.ir)
+  // ۴. آپلود FTP به CDN
   const ftpReport = [];
   let cdnPublicUrl = `https://upc.geekclub.ir/forum/instagram_downloader/${shortcode}/slide_1.${ext}`;
 
@@ -151,13 +139,7 @@ module.exports = async (req, res) => {
       client.close();
     }
   }
-// در api/instagram-proxy.js این بخش را بررسی کنید
-if (!mediaUrl) {
-  return res.status(404).json({ 
-    error: 'محتوای اینستاگرام یافت نشد، خصوصی است، یا توسط گارد TLS اینستاگرام مسدود شده است. لطفاً از توکن Apify API استفاده فرمایید.' 
-  });
-}
-  // ۵. بازگرداندن خروجی نهایی
+
   return res.status(200).json({
     shortcode: shortcode,
     caption: captionText,
